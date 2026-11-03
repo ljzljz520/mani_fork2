@@ -1,12 +1,12 @@
 package exec
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	"os/signal"
 	"strings"
 	"sync"
 	"time"
@@ -17,7 +17,7 @@ import (
 	"github.com/alajmo/mani/core/dao"
 )
 
-func (exec *Exec) Table(runFlags *core.RunFlags) dao.TableOutput {
+func (exec *Exec) table(b *Batch, runFlags *core.RunFlags) dao.TableOutput {
 	task := exec.Tasks[0]
 	clients := exec.Clients
 	projects := exec.Projects
@@ -29,18 +29,6 @@ func (exec *Exec) Table(runFlags *core.RunFlags) dao.TableOutput {
 			time.Sleep(500 * time.Millisecond)
 			spinner, spinnerErr = initSpinner()
 		}
-	}()
-
-	// In-case user interrupts, make sure spinner is stopped
-	go func() {
-		sigchan := make(chan os.Signal, 1)
-		signal.Notify(sigchan, os.Interrupt)
-		<-sigchan
-
-		if !runFlags.Silent && spinner != nil && spinnerErr == nil {
-			_ = spinner.Stop()
-		}
-		os.Exit(0)
 	}()
 
 	var data dao.TableOutput
@@ -86,18 +74,35 @@ func (exec *Exec) Table(runFlags *core.RunFlags) dao.TableOutput {
 	/**
 	** Values
 	**/
-	for i, c := range clients {
-		wg.Add()
+	for i := range clients {
+		// Stop launching new projects once the batch is done.
+		if err := wg.AddWithContext(b.Ctx()); err != nil {
+			break
+		}
+		// A slot may free in the same instant the batch is cancelled: never
+		// start the process in that race window.
+		if b.Ctx().Err() != nil {
+			wg.Done()
+			break
+		}
+
+		b.addWorker()
 		if task.SpecData.Parallel {
-			go func(i int, c Client, wg *core.SizedWaitGroup) {
+			go func(i int) {
 				defer wg.Done()
-				_ = exec.TableWork(i, runFlags.DryRun, data, &dataMutex)
-			}(i, c, &wg)
+				defer b.workerDone()
+				_ = exec.TableWork(b, i, runFlags.DryRun, data, &dataMutex)
+			}(i)
 		} else {
-			func(i int, c Client, wg *core.SizedWaitGroup) {
+			func(i int) {
 				defer wg.Done()
-				_ = exec.TableWork(i, runFlags.DryRun, data, &dataMutex)
-			}(i, c, &wg)
+				defer b.workerDone()
+				_ = exec.TableWork(b, i, runFlags.DryRun, data, &dataMutex)
+			}(i)
+
+			if b.Ctx().Err() != nil {
+				break
+			}
 		}
 	}
 	wg.Wait()
@@ -109,12 +114,17 @@ func (exec *Exec) Table(runFlags *core.RunFlags) dao.TableOutput {
 	return data
 }
 
-func (exec *Exec) TableWork(rIndex int, dryRun bool, data dao.TableOutput, dataMutex *sync.RWMutex) error {
+func (exec *Exec) TableWork(b *Batch, rIndex int, dryRun bool, data dao.TableOutput, dataMutex *sync.RWMutex) error {
 	client := exec.Clients[rIndex]
 	task := exec.Tasks[rIndex]
 	var wg sync.WaitGroup
 
 	for j, cmd := range task.Commands {
+		// Cancellation stops later commands even with ignore_errors set.
+		if err := b.Ctx().Err(); err != nil {
+			return b.mapCtxErr(err)
+		}
+
 		args := TableCmd{
 			rIndex: rIndex,
 			cIndex: j + 1,
@@ -130,13 +140,22 @@ func (exec *Exec) TableWork(rIndex int, dryRun bool, data dao.TableOutput, dataM
 			return ExecTTY(cmd.Cmd, cmd.EnvList)
 		}
 
-		err := RunTableCmd(args, data, dataMutex, &wg)
-		if err != nil && !task.SpecData.IgnoreErrors {
-			return err
+		err := RunTableCmd(b, args, data, dataMutex, &wg)
+		if err != nil {
+			if errors.Is(err, ErrInterrupted) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			if !task.SpecData.IgnoreErrors {
+				return err
+			}
 		}
 	}
 
 	if task.Cmd != "" {
+		if err := b.Ctx().Err(); err != nil {
+			return b.mapCtxErr(err)
+		}
+
 		args := TableCmd{
 			rIndex: rIndex,
 			cIndex: len(task.Commands) + 1,
@@ -152,9 +171,14 @@ func (exec *Exec) TableWork(rIndex int, dryRun bool, data dao.TableOutput, dataM
 			return ExecTTY(task.Cmd, task.EnvList)
 		}
 
-		err := RunTableCmd(args, data, dataMutex, &wg)
-		if err != nil && !task.SpecData.IgnoreErrors {
-			return err
+		err := RunTableCmd(b, args, data, dataMutex, &wg)
+		if err != nil {
+			if errors.Is(err, ErrInterrupted) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			if !task.SpecData.IgnoreErrors {
+				return err
+			}
 		}
 	}
 
@@ -163,18 +187,26 @@ func (exec *Exec) TableWork(rIndex int, dryRun bool, data dao.TableOutput, dataM
 	return nil
 }
 
-func RunTableCmd(t TableCmd, data dao.TableOutput, dataMutex *sync.RWMutex, wg *sync.WaitGroup) error {
+func RunTableCmd(b *Batch, t TableCmd, data dao.TableOutput, dataMutex *sync.RWMutex, wg *sync.WaitGroup) error {
 	combinedEnvs := dao.MergeEnvs(t.client.Env, t.env)
 
 	if t.dryRun {
+		if err := b.Ctx().Err(); err != nil {
+			return b.mapCtxErr(err)
+		}
 		data.Rows[t.rIndex].Columns[t.cIndex] = t.cmd
 		return nil
 	}
 
-	err := t.client.Run(t.shell, combinedEnvs, t.cmdArr)
+	err := t.client.Run(b.Ctx(), t.shell, combinedEnvs, t.cmdArr)
 	if err != nil {
+		if b.Ctx().Err() != nil {
+			return b.mapCtxErr(b.Ctx().Err())
+		}
 		return err
 	}
+
+	b.track(&t.client)
 
 	// Copy over commands STDOUT.
 	var stdoutHandler = func(client Client) {
@@ -207,7 +239,15 @@ func RunTableCmd(t TableCmd, data dao.TableOutput, dataMutex *sync.RWMutex, wg *
 
 	wg.Wait()
 
-	if err := t.client.Wait(); err != nil {
+	waitErr := t.client.Wait()
+	b.untrack(&t.client)
+
+	// An interrupt is never an ordinary (ignorable) command failure.
+	if b.Ctx().Err() != nil {
+		return b.mapCtxErr(b.Ctx().Err())
+	}
+
+	if waitErr != nil {
 		// Suppress Go's *exec.ExitError ("exit status N") — it's a stdlib
 		// stringification of the process exit code that adds no information
 		// the command's own stderr (already captured above) doesn't convey,
@@ -215,10 +255,10 @@ func RunTableCmd(t TableCmd, data dao.TableOutput, dataMutex *sync.RWMutex, wg *
 		// exit non-zero (e.g. `grep -v` with no matches). Real mani-level
 		// errors (I/O, plumbing) still surface in the cell.
 		var exitErr *exec.ExitError
-		if !errors.As(err, &exitErr) {
-			data.Rows[t.rIndex].Columns[t.cIndex] = fmt.Sprintf("%s\n%s", data.Rows[t.rIndex].Columns[t.cIndex], err.Error())
+		if !errors.As(waitErr, &exitErr) {
+			data.Rows[t.rIndex].Columns[t.cIndex] = fmt.Sprintf("%s\n%s", data.Rows[t.rIndex].Columns[t.cIndex], waitErr.Error())
 		}
-		return err
+		return waitErr
 	}
 
 	return nil

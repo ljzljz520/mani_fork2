@@ -2,6 +2,7 @@ package exec
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,40 +18,70 @@ import (
 	"github.com/alajmo/mani/core/dao"
 )
 
-func (exec *Exec) Text(
+// Text keeps the standalone (no cancellation/timeout) entry point used by
+// `mani sync` clone steps. run/exec/TUI go through stream() with a Batch.
+func (exec *Exec) Text(dryRun bool, stdout io.Writer, stderr io.Writer) {
+	b := NewBatch(context.Background(), 0, 0)
+	b.watch()
+	_ = exec.stream(b, dryRun, stdout, stderr)
+	_ = b.finish()
+}
+
+func (exec *Exec) stream(
+	b *Batch,
 	dryRun bool,
 	stdout io.Writer,
 	stderr io.Writer,
-) {
+) error {
 	task := exec.Tasks[0]
 	clients := exec.Clients
 
 	prefixMaxLen := calcMaxPrefixLength(clients)
 
 	wg := core.NewSizedWaitGroup(task.SpecData.Forks)
-	for i, c := range clients {
-		task := exec.Tasks[i]
-		wg.Add()
+	for i := range clients {
+		// Stop launching new projects once the batch is done. In parallel
+		// mode this unblocks queued projects waiting for a forks slot; in
+		// sequential mode it skips every project after the cancelled one.
+		if err := wg.AddWithContext(b.Ctx()); err != nil {
+			break
+		}
+		// A slot may free in the same instant the batch is cancelled: never
+		// start the process in that race window.
+		if b.Ctx().Err() != nil {
+			wg.Done()
+			break
+		}
 
+		b.addWorker()
 		if task.SpecData.Parallel {
-			go func(i int, c Client, wg *core.SizedWaitGroup) {
+			go func(i int) {
 				defer wg.Done()
-				_ = exec.TextWork(i, prefixMaxLen, dryRun, stdout, stderr)
-			}(i, c, &wg)
+				defer b.workerDone()
+				_ = exec.TextWork(b, i, prefixMaxLen, dryRun, stdout, stderr)
+			}(i)
 		} else {
-			func(i int, c Client, wg *core.SizedWaitGroup) {
+			func(i int) {
 				defer wg.Done()
-				_ = exec.TextWork(i, prefixMaxLen, dryRun, stdout, stderr)
-			}(i, c, &wg)
+				defer b.workerDone()
+				_ = exec.TextWork(b, i, prefixMaxLen, dryRun, stdout, stderr)
+			}(i)
+
+			if b.Ctx().Err() != nil {
+				break
+			}
 		}
 	}
 
 	wg.Wait()
 
 	fmt.Fprintf(stdout, "\n")
+
+	return b.failureErr()
 }
 
 func (exec *Exec) TextWork(
+	b *Batch,
 	rIndex int,
 	prefixMaxLen int,
 	dryRun bool,
@@ -70,6 +101,12 @@ func (exec *Exec) TextWork(
 
 	var wg sync.WaitGroup
 	for j, cmd := range task.Commands {
+		// Cancellation must stop this batch's later commands regardless of
+		// ignore_errors, which only applies to ordinary command failures.
+		if err := b.Ctx().Err(); err != nil {
+			return b.mapCtxErr(err)
+		}
+
 		args := TableCmd{
 			rIndex:   rIndex,
 			cIndex:   j,
@@ -88,13 +125,22 @@ func (exec *Exec) TextWork(
 			return ExecTTY(cmd.Cmd, cmd.EnvList)
 		}
 
-		err := RunTextCmd(args, task.ThemeData.Stream, prefix, task.SpecData.Parallel, &wg, stdout, stderr)
-		if err != nil && !task.SpecData.IgnoreErrors {
-			return err
+		err := RunTextCmd(b, args, task.ThemeData.Stream, prefix, task.SpecData.Parallel, &wg, stdout, stderr)
+		if err != nil {
+			if errors.Is(err, ErrInterrupted) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			if !task.SpecData.IgnoreErrors {
+				return err
+			}
 		}
 	}
 
 	if task.Cmd != "" {
+		if err := b.Ctx().Err(); err != nil {
+			return b.mapCtxErr(err)
+		}
+
 		args := TableCmd{
 			rIndex:   rIndex,
 			cIndex:   len(task.Commands),
@@ -113,9 +159,14 @@ func (exec *Exec) TextWork(
 			return ExecTTY(task.Cmd, task.EnvList)
 		}
 
-		err := RunTextCmd(args, task.ThemeData.Stream, prefix, task.SpecData.Parallel, &wg, stdout, stderr)
-		if err != nil && !task.SpecData.IgnoreErrors {
-			return err
+		err := RunTextCmd(b, args, task.ThemeData.Stream, prefix, task.SpecData.Parallel, &wg, stdout, stderr)
+		if err != nil {
+			if errors.Is(err, ErrInterrupted) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			if !task.SpecData.IgnoreErrors {
+				return err
+			}
 		}
 	}
 
@@ -125,6 +176,7 @@ func (exec *Exec) TextWork(
 }
 
 func RunTextCmd(
+	b *Batch,
 	t TableCmd,
 	textStyle dao.Stream,
 	prefix string,
@@ -140,14 +192,22 @@ func RunTextCmd(
 	}
 
 	if t.dryRun {
+		if err := b.Ctx().Err(); err != nil {
+			return b.mapCtxErr(err)
+		}
 		printCmd(prefix, t.cmd)
 		return nil
 	}
 
-	err := t.client.Run(t.shell, combinedEnvs, t.cmdArr)
+	err := t.client.Run(b.Ctx(), t.shell, combinedEnvs, t.cmdArr)
 	if err != nil {
+		if b.Ctx().Err() != nil {
+			return b.mapCtxErr(b.Ctx().Err())
+		}
 		return err
 	}
+
+	b.track(&t.client)
 
 	// Copy over commands STDOUT.
 	wg.Add(1)
@@ -183,20 +243,29 @@ func RunTextCmd(
 
 	wg.Wait()
 
-	if err := t.client.Wait(); err != nil {
+	waitErr := t.client.Wait()
+	b.untrack(&t.client)
+
+	// Cancellation takes precedence over whatever the command exited with:
+	// an interrupt is never reported as an ordinary (ignorable) failure.
+	if b.Ctx().Err() != nil {
+		return b.mapCtxErr(b.Ctx().Err())
+	}
+
+	if waitErr != nil {
 		// See table.go: suppress Go's *exec.ExitError ("exit status N");
 		// the command's own stderr was already streamed above. Real
 		// mani-level errors still print.
 		var exitErr *exec.ExitError
-		if !errors.As(err, &exitErr) {
+		if !errors.As(waitErr, &exitErr) {
 			if prefix != "" {
-				fmt.Fprintf(stderr, "%s%s\n", prefix, err)
+				fmt.Fprintf(stderr, "%s%s\n", prefix, waitErr)
 			} else {
-				fmt.Fprintf(stderr, "%s\n", err)
+				fmt.Fprintf(stderr, "%s\n", waitErr)
 			}
 		}
 
-		return err
+		return waitErr
 	}
 
 	return nil

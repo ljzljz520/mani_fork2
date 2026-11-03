@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -66,6 +67,7 @@ executed in each directory.`,
 	cmd.Flags().BoolVar(&runFlags.OmitEmptyColumns, "omit-empty-columns", false, "omit empty columns in table output")
 	cmd.Flags().BoolVar(&runFlags.Parallel, "parallel", false, "run tasks in parallel across projects")
 	cmd.Flags().Uint32P("forks", "f", 4, "maximum number of concurrent processes")
+	cmd.Flags().DurationVar(&runFlags.Timeout, "timeout", 0, "abort the batch after duration (e.g. 30s, 5m); running processes are stopped")
 	cmd.Flags().BoolVarP(&runFlags.Cwd, "cwd", "k", false, "use current working directory")
 	cmd.Flags().BoolVarP(&runFlags.All, "all", "a", false, "target all projects")
 
@@ -164,6 +166,6 @@ func execute(
 	core.CheckIfError(err)
 
 	target := exec.Exec{Projects: projects, Tasks: tasks, Config: *config}
-	err = target.Run([]string{}, runFlags, setRunFlags)
+	err = target.Run(context.Background(), []string{}, runFlags, setRunFlags)
 	core.CheckIfError(err)
 }

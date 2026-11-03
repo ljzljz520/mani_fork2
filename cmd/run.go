@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -92,6 +93,7 @@ The tasks are specified in a mani.yaml file along with the projects you can targ
 	cmd.Flags().BoolVar(&runFlags.Parallel, "parallel", false, "execute tasks in parallel across projects")
 	cmd.Flags().BoolVarP(&runFlags.Edit, "edit", "e", false, "edit task")
 	cmd.Flags().Uint32P("forks", "f", 4, "maximum number of concurrent processes")
+	cmd.Flags().DurationVar(&runFlags.Timeout, "timeout", 0, "abort the batch after duration (e.g. 30s, 5m); running processes are stopped")
 
 	cmd.Flags().StringVarP(&runFlags.Output, "output", "o", "", "set output format [stream|table|markdown|html]")
 	err := cmd.RegisterFlagCompletionFunc("output", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
@@ -214,6 +216,6 @@ func run(
 	core.CheckIfError(err)
 
 	target := exec.Exec{Projects: projects, Tasks: tasks, Config: *config}
-	err = target.Run(userArgs, runFlags, setRunFlags)
+	err = target.Run(context.Background(), userArgs, runFlags, setRunFlags)
 	core.CheckIfError(err)
 }

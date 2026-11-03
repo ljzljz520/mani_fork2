@@ -1,6 +1,7 @@
 package exec
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -19,16 +20,25 @@ type Client struct {
 	running bool
 }
 
-func (c *Client) Run(shell string, env []string, cmdStr []string) error {
+func (c *Client) Run(ctx context.Context, shell string, env []string, cmdStr []string) error {
 	var err error
 	if c.running {
 		return fmt.Errorf("command already running")
+	}
+
+	// Do not start a new process once the batch is done.
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	cmd := exec.Command(shell, cmdStr...)
 
 	cmd.Dir = c.Path
 	cmd.Env = append(os.Environ(), env...)
+
+	// Put the child in its own process group/tree so notifications and
+	// forced reaping reach the shell *and* all of its descendants.
+	configureProcess(cmd)
 
 	c.cmd = cmd
 

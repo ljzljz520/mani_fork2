@@ -17,6 +17,16 @@ func HandleInput(app *App) {
 	misc.App.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		currentFocus := misc.App.GetFocus()
 
+		// Ctrl+C cancels the running batch (keeping the TUI alive); when no
+		// batch is running it quits the application.
+		if event.Key() == tcell.KeyCtrlC {
+			if misc.CancelActiveBatch() {
+				return nil
+			}
+			misc.App.Stop()
+			return nil
+		}
+
 		switch event.Key() {
 		case tcell.KeyF1:
 			SwitchToPage("run")

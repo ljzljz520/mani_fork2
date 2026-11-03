@@ -1,5 +1,7 @@
 package core
 
+import "time"
+
 // CMD Flags
 
 type TUIFlags struct {
@@ -68,6 +70,7 @@ type RunFlags struct {
 	OmitEmptyColumns  bool
 	Output            string
 	Forks             uint32
+	Timeout           time.Duration
 }
 
 type SetRunFlags struct {

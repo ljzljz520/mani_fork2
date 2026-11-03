@@ -1,6 +1,8 @@
 package pages
 
 import (
+	"context"
+
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 
@@ -14,6 +16,7 @@ import (
 
 type TRunPage struct {
 	focusable []*misc.TItem
+	launcher  batchLauncher
 }
 
 func CreateRunPage(
@@ -346,68 +349,59 @@ func (r *TRunPage) runTasks(
 		projectNames = append(projectNames, project.Name)
 	}
 
-	// Flags
-	runFlags := core.RunFlags{
-		Silent: true,
-
-		// Filter
-		Cwd:      false,
-		All:      false,
-		TagsExpr: "",
-
-		Target: "default",
-		Spec:   "default",
-
-		Projects:          projectNames,
-		Output:            spec.Output,
-		Parallel:          spec.Parallel,
-		IgnoreErrors:      spec.IgnoreErrors,
-		IgnoreNonExisting: spec.IgnoreNonExisting,
-		OmitEmptyRows:     spec.OmitEmptyRows,
-		OmitEmptyColumns:  spec.OmitEmptyColumns,
-	}
-	setRunFlags := core.SetRunFlags{
-		Parallel:          spec.Parallel,
-		All:               true,
-		Cwd:               true,
-		IgnoreErrors:      true,
-		IgnoreNonExisting: true,
-		OmitEmptyRows:     true,
-		OmitEmptyColumns:  true,
-	}
-
-	// Parse Task
-	var err error
-	var tasks []dao.Task
-	var projects []dao.Project
-	if len(taskNames) == 1 {
-		tasks, projects, err = dao.ParseSingleTask(taskNames[0], &runFlags, &setRunFlags, misc.Config)
-	} else {
-		tasks, projects, err = dao.ParseManyTasks(taskNames, &runFlags, &setRunFlags, misc.Config)
-	}
-	if err != nil {
-		misc.App.Stop()
-	}
-
-	// Run task
-	target := exec.Exec{Projects: projects, Tasks: tasks, Config: *misc.Config}
-
 	if spec.ClearBeforeRun {
 		streamView.Clear()
 	}
+	text := streamView.GetText(false)
+	streamView.SetText(text + "\n")
 
-	if spec.Output == "table" {
-		text := streamView.GetText(false)
-		streamView.SetText(text + "\n")
-	} else {
-		text := streamView.GetText(false)
-		streamView.SetText(text + "\n")
-	}
+	// Start off the UI goroutine: the TUI keeps responding and the batch can
+	// be cancelled (Ctrl+C) or superseded (Ctrl+R) while it runs.
+	r.launcher.launch(streamView, ansiWriter, func(ctx context.Context) (*exec.Batch, error) {
+		// Flags
+		runFlags := core.RunFlags{
+			Silent: true,
 
-	err = target.RunTUI([]string{}, &runFlags, &setRunFlags, spec.Output, ansiWriter, ansiWriter)
-	if err != nil {
-		misc.App.Stop()
-	}
+			// Filter
+			Cwd:      false,
+			All:      false,
+			TagsExpr: "",
 
-	streamView.ScrollToEnd()
+			Target: "default",
+			Spec:   "default",
+
+			Projects:          projectNames,
+			Output:            spec.Output,
+			Parallel:          spec.Parallel,
+			IgnoreErrors:      spec.IgnoreErrors,
+			IgnoreNonExisting: spec.IgnoreNonExisting,
+			OmitEmptyRows:     spec.OmitEmptyRows,
+			OmitEmptyColumns:  spec.OmitEmptyColumns,
+		}
+		setRunFlags := core.SetRunFlags{
+			Parallel:          spec.Parallel,
+			All:               true,
+			Cwd:               true,
+			IgnoreErrors:      true,
+			IgnoreNonExisting: true,
+			OmitEmptyRows:     true,
+			OmitEmptyColumns:  true,
+		}
+
+		// Parse Task
+		var tasks []dao.Task
+		var projects []dao.Project
+		var err error
+		if len(taskNames) == 1 {
+			tasks, projects, err = dao.ParseSingleTask(taskNames[0], &runFlags, &setRunFlags, misc.Config)
+		} else {
+			tasks, projects, err = dao.ParseManyTasks(taskNames, &runFlags, &setRunFlags, misc.Config)
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		target := exec.Exec{Projects: projects, Tasks: tasks, Config: *misc.Config}
+		return target.RunTUI(ctx, []string{}, &runFlags, &setRunFlags, spec.Output, ansiWriter, ansiWriter)
+	})
 }

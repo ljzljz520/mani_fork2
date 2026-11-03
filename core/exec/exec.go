@@ -1,9 +1,11 @@
 package exec
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
 
 	"github.com/gookit/color"
@@ -35,21 +37,24 @@ type TableCmd struct {
 	numTasks int
 }
 
+// Run executes a CLI batch. Interrupt signals (SIGINT/SIGTERM) and the
+// optional timeout share one lifecycle: they stop dispatching new projects,
+// notify already started processes and reap their trees after the grace
+// period. Interruption is always returned as an error so it is never
+// reported as success. The signal listener is removed before returning.
 func (exec *Exec) Run(
+	ctx context.Context,
 	userArgs []string,
 	runFlags *core.RunFlags,
 	setRunFlags *core.SetRunFlags,
 ) error {
-	projects := exec.Projects
-	tasks := exec.Tasks
-
 	err := exec.ParseTask(userArgs, runFlags, setRunFlags)
 	if err != nil {
 		return err
 	}
 
-	clientCh := make(chan Client, len(projects))
-	errCh := make(chan error, len(projects))
+	clientCh := make(chan Client, len(exec.Projects))
+	errCh := make(chan error, len(exec.Projects))
 	err = exec.SetClients(clientCh, errCh)
 	if err != nil {
 		return err
@@ -57,75 +62,117 @@ func (exec *Exec) Run(
 
 	// Describe task
 	if runFlags.Describe {
-		out := print.PrintTaskBlock([]dao.Task{tasks[0]}, false, tasks[0].ThemeData.Block, print.GookitFormatter{})
+		out := print.PrintTaskBlock([]dao.Task{exec.Tasks[0]}, false, exec.Tasks[0].ThemeData.Block, print.GookitFormatter{})
 		fmt.Print(out)
 	}
 
 	exec.CheckTaskNoColor()
 
-	switch tasks[0].SpecData.Output {
-	case "table", "html", "markdown":
-		fmt.Println("")
-		data := exec.Table(runFlags)
-		options := print.PrintTableOptions{
-			Theme:            tasks[0].ThemeData,
-			Output:           tasks[0].SpecData.Output,
-			Color:            *tasks[0].ThemeData.Color,
-			AutoWrap:         true,
-			OmitEmptyRows:    tasks[0].SpecData.OmitEmptyRows,
-			OmitEmptyColumns: tasks[0].SpecData.OmitEmptyColumns,
-		}
-		print.PrintTable(data.Rows, options, data.Headers[0:1], data.Headers[1:], os.Stdout)
-		fmt.Println("")
-	default:
-		exec.Text(runFlags.DryRun, os.Stdout, os.Stderr)
-	}
+	batch := NewBatch(ctx, runFlags.Timeout, 0)
+	batch.watch()
 
-	return nil
+	// CLI-only signal handling. The TUI owns the terminal (raw mode) and
+	// cancels batches via key events, so it must never install a listener
+	// that would kill the whole application.
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, interruptSignals()...)
+	listenerDone := make(chan struct{})
+	go func() {
+		select {
+		case <-sigCh:
+			// First interrupt: polite cancellation.
+			batch.Interrupt()
+		case <-batch.Done():
+		}
+
+		select {
+		case <-sigCh:
+			// Second interrupt: skip the grace period.
+			batch.Force()
+		case <-batch.Done():
+		}
+
+		// Detach the listener so no signal handler outlives the batch.
+		signal.Stop(sigCh)
+		close(listenerDone)
+	}()
+
+	runErr := exec.executeBatch(batch, runFlags, os.Stdout, os.Stderr, true)
+	batchErr := batch.finish()
+
+	<-listenerDone
+
+	if batchErr != nil {
+		return batchErr
+	}
+	return runErr
 }
 
+// RunTUI prepares and starts a batch asynchronously, returning its handle
+// so the TUI stays responsive and can cancel it. All output-copying
+// goroutines have exited by the time the returned batch's Done channel
+// closes, preventing stale writes into later batches.
 func (exec *Exec) RunTUI(
+	ctx context.Context,
 	userArgs []string,
 	runFlags *core.RunFlags,
 	setRunFlags *core.SetRunFlags,
 	output string,
 	outWriter io.Writer,
 	errWriter io.Writer,
-) error {
-	projects := exec.Projects
+) (*Batch, error) {
 	err := exec.ParseTask(userArgs, runFlags, setRunFlags)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	tasks := exec.Tasks
-
-	clientCh := make(chan Client, len(projects))
-	errCh := make(chan error, len(projects))
+	clientCh := make(chan Client, len(exec.Projects))
+	errCh := make(chan error, len(exec.Projects))
 	err = exec.SetClients(clientCh, errCh)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	data := dao.TableOutput{}
-	switch output {
-	case "table":
-		data = exec.Table(runFlags)
-		options := print.PrintTableOptions{
-			Theme:            tasks[0].ThemeData,
-			Output:           tasks[0].SpecData.Output,
-			Color:            *tasks[0].ThemeData.Color,
-			AutoWrap:         false,
-			OmitEmptyRows:    tasks[0].SpecData.OmitEmptyRows,
-			OmitEmptyColumns: tasks[0].SpecData.OmitEmptyColumns,
+	batch := NewBatch(ctx, runFlags.Timeout, 0)
+	batch.watch()
+
+	go func() {
+		_ = exec.executeBatch(batch, runFlags, outWriter, errWriter, false)
+		_ = batch.finish()
+	}()
+
+	return batch, nil
+}
+
+func (exec *Exec) executeBatch(
+	batch *Batch,
+	runFlags *core.RunFlags,
+	stdout io.Writer,
+	stderr io.Writer,
+	autoWrap bool,
+) error {
+	switch exec.Tasks[0].SpecData.Output {
+	case "table", "html", "markdown":
+		data := exec.table(batch, runFlags)
+		if err := batch.failureErr(); err != nil {
+			return err
 		}
-		print.PrintTable(data.Rows, options, data.Headers[0:1], data.Headers[1:], outWriter)
-		return nil
+
+		options := print.PrintTableOptions{
+			Theme:            exec.Tasks[0].ThemeData,
+			Output:           exec.Tasks[0].SpecData.Output,
+			Color:            *exec.Tasks[0].ThemeData.Color,
+			AutoWrap:         autoWrap,
+			OmitEmptyRows:    exec.Tasks[0].SpecData.OmitEmptyRows,
+			OmitEmptyColumns: exec.Tasks[0].SpecData.OmitEmptyColumns,
+		}
+		print.PrintTable(data.Rows, options, data.Headers[0:1], data.Headers[1:], stdout)
+		fmt.Fprintln(stdout)
 	default:
-		exec.Text(runFlags.DryRun, outWriter, errWriter)
+		return exec.stream(batch, runFlags.DryRun, stdout, stderr)
 	}
 
-	return err
+	return nil
 }
 
 func (exec *Exec) SetClients(

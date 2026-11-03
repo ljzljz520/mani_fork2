@@ -1,6 +1,8 @@
 package pages
 
 import (
+	"context"
+
 	"github.com/gdamore/tcell/v2"
 	"github.com/jinzhu/copier"
 	"github.com/rivo/tview"
@@ -15,6 +17,7 @@ import (
 
 type TExecPage struct {
 	focusable []*misc.TItem
+	launcher  batchLauncher
 }
 
 func CreateExecPage(
@@ -299,72 +302,67 @@ func (e *TExecPage) runCmd(
 		return
 	}
 
-	// Task
-	task := dao.Task{Name: "", Cmd: cmd}
-	taskErrors := make([]dao.ResourceErrors[dao.Task], 1)
-	task.ParseTask(*misc.Config, &taskErrors[0])
-	task.SpecData.Output = spec.Output
-	task.SpecData.Parallel = spec.Parallel
-	task.SpecData.IgnoreErrors = spec.IgnoreErrors
-	task.SpecData.IgnoreNonExisting = spec.IgnoreNonExisting
-	task.SpecData.OmitEmptyRows = spec.OmitEmptyRows
-	task.SpecData.OmitEmptyColumns = spec.OmitEmptyColumns
-
-	// Flags
-	runFlags := core.RunFlags{
-		Silent: true,
-
-		// Target
-		Cwd:      false,
-		All:      false,
-		TagsExpr: "",
-
-		Target: "default",
-		Spec:   "default",
-
-		Output:            spec.Output,
-		Parallel:          spec.Parallel,
-		IgnoreErrors:      spec.IgnoreErrors,
-		IgnoreNonExisting: spec.IgnoreNonExisting,
-		OmitEmptyRows:     spec.OmitEmptyRows,
-		OmitEmptyColumns:  spec.OmitEmptyColumns,
-	}
-	setRunFlags := core.SetRunFlags{
-		Parallel:          spec.Parallel,
-		All:               true,
-		Cwd:               true,
-		IgnoreErrors:      true,
-		IgnoreNonExisting: true,
-		OmitEmptyRows:     true,
-		OmitEmptyColumns:  true,
-	}
-
-	// Preprocess
-	var tasks []dao.Task
-	for range selectedProjects {
-		t := dao.Task{}
-		err := copier.Copy(&t, &task)
-		core.CheckIfError(err)
-		tasks = append(tasks, t)
-	}
-
-	// Run
-	target := exec.Exec{Projects: selectedProjects, Tasks: tasks, Config: *misc.Config}
-
 	if spec.ClearBeforeRun {
 		streamView.Clear()
 	}
+	text := streamView.GetText(false)
+	streamView.SetText(text + "\n")
 
-	if spec.Output == "table" {
-		text := streamView.GetText(false)
-		streamView.SetText(text + "\n")
-	} else {
-		text := streamView.GetText(false)
-		streamView.SetText(text + "\n")
-	}
+	// Start off the UI goroutine: the TUI keeps responding and the batch can
+	// be cancelled (Ctrl+C) or superseded (Ctrl+R) while it runs.
+	e.launcher.launch(streamView, ansiWriter, func(ctx context.Context) (*exec.Batch, error) {
+		// Task
+		task := dao.Task{Name: "", Cmd: cmd}
+		taskErrors := make([]dao.ResourceErrors[dao.Task], 1)
+		task.ParseTask(*misc.Config, &taskErrors[0])
+		task.SpecData.Output = spec.Output
+		task.SpecData.Parallel = spec.Parallel
+		task.SpecData.IgnoreErrors = spec.IgnoreErrors
+		task.SpecData.IgnoreNonExisting = spec.IgnoreNonExisting
+		task.SpecData.OmitEmptyRows = spec.OmitEmptyRows
+		task.SpecData.OmitEmptyColumns = spec.OmitEmptyColumns
 
-	err := target.RunTUI([]string{}, &runFlags, &setRunFlags, spec.Output, ansiWriter, ansiWriter)
-	core.CheckIfError(err)
+		// Flags
+		runFlags := core.RunFlags{
+			Silent: true,
 
-	streamView.ScrollToEnd()
+			// Target
+			Cwd:      false,
+			All:      false,
+			TagsExpr: "",
+
+			Target: "default",
+			Spec:   "default",
+
+			Output:            spec.Output,
+			Parallel:          spec.Parallel,
+			IgnoreErrors:      spec.IgnoreErrors,
+			IgnoreNonExisting: spec.IgnoreNonExisting,
+			OmitEmptyRows:     spec.OmitEmptyRows,
+			OmitEmptyColumns:  spec.OmitEmptyColumns,
+		}
+		setRunFlags := core.SetRunFlags{
+			Parallel:          spec.Parallel,
+			All:               true,
+			Cwd:               true,
+			IgnoreErrors:      true,
+			IgnoreNonExisting: true,
+			OmitEmptyRows:     true,
+			OmitEmptyColumns:  true,
+		}
+
+		// Preprocess
+		var tasks []dao.Task
+		for range selectedProjects {
+			t := dao.Task{}
+			err := copier.Copy(&t, &task)
+			if err != nil {
+				return nil, err
+			}
+			tasks = append(tasks, t)
+		}
+
+		target := exec.Exec{Projects: selectedProjects, Tasks: tasks, Config: *misc.Config}
+		return target.RunTUI(ctx, []string{}, &runFlags, &setRunFlags, spec.Output, ansiWriter, ansiWriter)
+	})
 }
